@@ -6,13 +6,13 @@ metadata:
     app: demand-api
 
 spec:
-  replicas: TODO
+  replicas: 2
 
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxSurge: TODO
-      maxUnavailable: TODO
+      maxSurge: 1
+      maxUnavailable: 1
 
   selector:
     matchLabels:
@@ -35,10 +35,12 @@ spec:
           - /bin/sh
           - -c
           - |
+            # Authenticate using service account key
+            gcloud auth activate-service-account --key-file=/var/secrets/gcs/key.json
             gsutil cp gs://${GCS_BUCKET}/demand_enriched.parquet /data/processed/
-            gsutil cp gs://${GCS_BUCKET}/demand_api_model.joblib /data/processed/
+            gsutil cp gs://${GCS_BUCKET}/lgbm_demand_model.txt /data/processed/
             gsutil cp gs://${GCS_BUCKET}/zone_hour_avg_fare.parquet /data/processed/
-            gsutil cp gs://${GCS_BUCKET}/taxi_zones.geojson /data/processed/
+            gsutil cp gs://${GCS_BUCKET}/taxi_zones.geojson /app/frontend/public/
         env:
         - name: GCS_BUCKET
           valueFrom:
@@ -48,11 +50,13 @@ spec:
         volumeMounts:
         - name: data
           mountPath: /data/processed
+        - name: taxi-zones
+          mountPath: /app/frontend/public
 
       containers:
       - name: demand-api
-        image: us-central1-docker.pkg.dev/[YOUR-NAME]/docker-repo/demand-api:latest
-        imagePullPolicy: TODO
+        image: us-central1-docker.pkg.dev/ops-ai-victoria/docker-repo/demand-api:latest
+        imagePullPolicy: Always
         ports:
         - containerPort: 8000
         env:
@@ -63,31 +67,35 @@ spec:
               key: GCS_BUCKET
         resources:
           requests:
-            cpu: TODO
-            memory: TODO
+            cpu: 512m
+            memory: 1Gi
           limits:
-            cpu: TODO
-            memory: TODO
+            cpu: 1000m
+            memory: 3Gi
         readinessProbe:
           httpGet:
             path: /health
             port: 8000
-          initialDelaySeconds: TODO
-          periodSeconds: TODO
-          failureThreshold: TODO
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 3
         livenessProbe:
           httpGet:
             path: /health
             port: 8000
-          initialDelaySeconds: TODO
-          periodSeconds: TODO
-          failureThreshold: TODO
+          initialDelaySeconds: 60
+          periodSeconds: 20
+          failureThreshold: 3
 
         volumeMounts:
         - name: data
           mountPath: /data/processed
+        - name: taxi-zones
+          mountPath: /app/frontend/public
 
       # Shared volume for init container + main container
       volumes:
       - name: data
+        emptyDir: {}
+      - name: taxi-zones
         emptyDir: {}
