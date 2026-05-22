@@ -7,7 +7,6 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime, timedelta
 import json
-import requests
 import joblib
 from functools import lru_cache
 
@@ -206,31 +205,13 @@ _zone_coords = _load_zone_coordinates()
 @lru_cache(maxsize=500)
 def _get_drive_time(from_zone: int, to_zone: int) -> int:
     """
-    Calculate real driving time between zones using OSRM.
-    Falls back to distance-based estimate if OSRM fails.
+    Estimate driving time between zones using local geometry only.
+    This avoids slow external routing calls during request handling.
     Returns drive time in minutes.
     """
     if from_zone not in _zone_coords or to_zone not in _zone_coords:
         # Fallback: estimate 3 mins per mile, ~2 miles avg per zone
         return max(3, abs(from_zone - to_zone) // 20)  # rough heuristic
-
-    try:
-        from_coord = _zone_coords[from_zone]
-        to_coord = _zone_coords[to_zone]
-
-        # OSRM public API endpoint (free, open source)
-        url = f"http://router.project-osrm.org/route/v1/driving/{from_coord['lon']},{from_coord['lat']};{to_coord['lon']},{to_coord['lat']}?overview=false"
-
-        response = requests.get(url, timeout=3)
-        if response.status_code == 200:
-            data = response.json()
-            if data['routes']:
-                # Duration is in seconds, convert to minutes
-                duration_mins = int(data['routes'][0]['duration'] / 60)
-                return max(2, duration_mins)  # minimum 2 mins
-
-    except Exception as e:
-        pass  # Fall through to fallback
 
     # Fallback: rough distance estimate
     from_coord = _zone_coords.get(from_zone, {'lat': 40.75, 'lon': -73.97})
@@ -489,43 +470,18 @@ def forecast_demand(zone_id: int, hour: int, dow: int, num_steps: int = 16, date
     if _lgbm_model is None or _full_demand is None:
         return []
     
-    # Get zone metadata
-    zone_info = _zone_map.get(zone_id, {})
-    
-    # Get synthetic current demand to use as baseline for lags
-    synthetic_current = _generate_synthetic_current_demand(hour, dow)
-    current_synthetic_demand = synthetic_current.get(zone_id, 0.0)
-    
-    # Build synthetic history starting from current time going back
-    now = pd.Timestamp.now()
-    synthetic_history = []
-    
-    # Add 7 days of synthetic history (backwards from now)
-    for days_back in range(7, 0, -1):
-        for hr in range(24):
-            for slot in range(4):  # 4 x 15-min slots per hour
-                past_time = now - timedelta(days=days_back, hours=hr, minutes=slot*15)
-                past_hour = past_time.hour
-                past_dow = past_time.dayofweek
-                
-                past_synthetic = _generate_synthetic_current_demand(past_hour, past_dow)
-                past_demand = past_synthetic.get(zone_id, 0.0)
-                
-                synthetic_history.append({
-                    'time_bucket': past_time,
-                    'trip_count': past_demand,
-                    'borough_id': int(_full_demand[_full_demand['PULocationID'] == zone_id]['borough_id'].iloc[0]) if len(_full_demand[_full_demand['PULocationID'] == zone_id]) > 0 else 0,
-                    'service_zone_id': int(_full_demand[_full_demand['PULocationID'] == zone_id]['service_zone_id'].iloc[0]) if len(_full_demand[_full_demand['PULocationID'] == zone_id]) > 0 else 0,
-                    'is_airport_zone': 1 if zone_id in AIRPORT_ZONES else 0,
-                    'zone_slot_baseline': float(_full_demand[_full_demand['PULocationID'] == zone_id]['zone_slot_baseline'].iloc[0]) if len(_full_demand[_full_demand['PULocationID'] == zone_id]) > 0 else 0.0,
-                })
-    
-    synthetic_history_df = pd.DataFrame(synthetic_history)
-    
     # Get zone metadata from actual data
     zone_data = _full_demand[_full_demand['PULocationID'] == zone_id]
     if zone_data.empty:
         return []
+
+    model_features = FEATURES[:getattr(_lgbm_model, "n_features_in_", len(FEATURES))]
+    needs_lag_features = any(
+        feature.startswith("lag_") or feature.startswith("roll_mean_")
+        for feature in model_features
+    )
+
+    now = pd.Timestamp.now()
     
     last_borough_id = int(zone_data['borough_id'].iloc[0])
     last_service_zone_id = int(zone_data['service_zone_id'].iloc[0])
@@ -533,19 +489,46 @@ def forecast_demand(zone_id: int, hour: int, dow: int, num_steps: int = 16, date
     zone_slot_baseline = float(zone_data['zone_slot_baseline'].iloc[0])
     is_holiday = 0
     cbd_pricing_active = 0
-    
-    # Add current synthetic demand to history
-    synthetic_history_df = pd.concat([
-        synthetic_history_df,
-        pd.DataFrame({
-            'time_bucket': [now],
-            'trip_count': [current_synthetic_demand],
-            'borough_id': [last_borough_id],
-            'service_zone_id': [last_service_zone_id],
-            'is_airport_zone': [is_airport],
-            'zone_slot_baseline': [zone_slot_baseline],
-        })
-    ], ignore_index=True)
+
+    if needs_lag_features:
+        # Get synthetic current demand to use as baseline for lags
+        synthetic_current = _generate_synthetic_current_demand(hour, dow)
+        current_synthetic_demand = synthetic_current.get(zone_id, 0.0)
+
+        # Build synthetic history starting from current time going back
+        synthetic_history = []
+
+        # Add 7 days of synthetic history (backwards from now)
+        for days_back in range(7, 0, -1):
+            for hr in range(24):
+                for slot in range(4):  # 4 x 15-min slots per hour
+                    past_time = now - timedelta(days=days_back, hours=hr, minutes=slot*15)
+                    past_hour = past_time.hour
+                    past_dow = past_time.dayofweek
+
+                    past_synthetic = _generate_synthetic_current_demand(past_hour, past_dow)
+                    past_demand = past_synthetic.get(zone_id, 0.0)
+
+                    synthetic_history.append({
+                        'time_bucket': past_time,
+                        'trip_count': past_demand,
+                        'borough_id': last_borough_id,
+                        'service_zone_id': last_service_zone_id,
+                        'is_airport_zone': is_airport,
+                        'zone_slot_baseline': zone_slot_baseline,
+                    })
+
+        synthetic_history_df = pd.concat([
+            pd.DataFrame(synthetic_history),
+            pd.DataFrame({
+                'time_bucket': [now],
+                'trip_count': [current_synthetic_demand],
+                'borough_id': [last_borough_id],
+                'service_zone_id': [last_service_zone_id],
+                'is_airport_zone': [is_airport],
+                'zone_slot_baseline': [zone_slot_baseline],
+            })
+        ], ignore_index=True)
     
     # Start predictions
     predictions = []
@@ -555,8 +538,12 @@ def forecast_demand(zone_id: int, hour: int, dow: int, num_steps: int = 16, date
         # Compute temporal features
         temporal_feats = _compute_temporal_features(current_time)
         
-        # Calculate lags and rolling means based on synthetic history
-        lag_feats = _calculate_lags_and_rolling(synthetic_history_df, current_time - timedelta(minutes=15))
+        # Calculate lags and rolling means only when the loaded model expects them.
+        lag_feats = (
+            _calculate_lags_and_rolling(synthetic_history_df, current_time - timedelta(minutes=15))
+            if needs_lag_features
+            else {}
+        )
         
         # Build feature vector
         features_dict = {
@@ -571,8 +558,7 @@ def forecast_demand(zone_id: int, hour: int, dow: int, num_steps: int = 16, date
             **lag_feats,
         }
         
-        # Create feature dataframe in correct order
-        X_pred = pd.DataFrame([features_dict])[FEATURES]
+        X_pred = pd.DataFrame([features_dict])[model_features]
         
         # Make prediction
         pred_value = _lgbm_model.predict(X_pred)[0]
@@ -585,18 +571,19 @@ def forecast_demand(zone_id: int, hour: int, dow: int, num_steps: int = 16, date
             'minute': temporal_feats['minute'],
         })
         
-        # Add predicted value to synthetic history for next lag calculation
-        synthetic_history_df = pd.concat([
-            synthetic_history_df,
-            pd.DataFrame({
-                'time_bucket': [current_time],
-                'trip_count': [pred_value],
-                'borough_id': [last_borough_id],
-                'service_zone_id': [last_service_zone_id],
-                'is_airport_zone': [is_airport],
-                'zone_slot_baseline': [zone_slot_baseline],
-            })
-        ], ignore_index=True)
+        if needs_lag_features:
+            # Add predicted value to synthetic history for next lag calculation
+            synthetic_history_df = pd.concat([
+                synthetic_history_df,
+                pd.DataFrame({
+                    'time_bucket': [current_time],
+                    'trip_count': [pred_value],
+                    'borough_id': [last_borough_id],
+                    'service_zone_id': [last_service_zone_id],
+                    'is_airport_zone': [is_airport],
+                    'zone_slot_baseline': [zone_slot_baseline],
+                })
+            ], ignore_index=True)
         
         current_time += timedelta(minutes=15)
     
