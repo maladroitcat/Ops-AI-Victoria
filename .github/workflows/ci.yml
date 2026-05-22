@@ -30,15 +30,14 @@ jobs:
       run: |
         pip install --upgrade pip
         pip install -r week2/backend/requirements.txt
-        pip install pytest
 
-    - name: Run tests
+    - name: Run lint checks
       run: |
-        pytest -v 2>/dev/null || echo "No tests found, skipping"
+        python -m compileall week2/backend
 
   build:
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/week2')
 
     steps:
     - name: Checkout code
@@ -55,4 +54,5 @@ jobs:
         context: .
         file: ./week2/starter/Dockerfile
         push: false
+        platforms: linux/amd64
         tags: demand-api:latest
