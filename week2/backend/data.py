@@ -14,7 +14,7 @@ from functools import lru_cache
 _ROOT = Path(__file__).parent.parent.parent
 DATA_PATH = _ROOT / "data" / "processed" / "demand_enriched.parquet"
 LOOKUP_PATH = _ROOT / "metadata" / "Lookups" / "taxi_zone_lookup.csv"
-MODEL_PATH = _ROOT / "data" / "processed" / "lgbm_demand_model.txt"
+MODEL_PATH = _ROOT / "data" / "processed" / "demand_api_model.joblib"
 
 # Fixed reference point: end of 2nd week in Feb 2026 (the latest complete month)
 # Data before this date is actual; from this point forward uses model predictions
@@ -166,13 +166,11 @@ def _load():
 
 def _load_model():
     try:
-        import lightgbm as lgb
-
-        model = lgb.Booster(model_file=str(MODEL_PATH))
-        print("[NYC Cab Analytics] LightGBM model loaded.")
+        model = joblib.load(str(MODEL_PATH))
+        print("[NYC Cab Analytics] Model loaded.")
         return model
     except Exception as e:
-        print(f"[NYC Cab Analytics] Error loading LightGBM model: {e}")
+        print(f"[NYC Cab Analytics] Error loading model: {e}")
         return None
 
 
